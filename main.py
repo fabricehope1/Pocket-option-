@@ -3,6 +3,7 @@ import requests
 import pandas as pd
 import ta
 import pytz
+import numpy as np
 
 from datetime import datetime, timedelta
 from fastapi import FastAPI
@@ -34,17 +35,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 app = FastAPI()
 
 # ==========================================
-# STORE USER DATA
+# USER STORE
 # ==========================================
 
 user_data_store = {}
 
 # ==========================================
-# AVAILABLE PAIRS
+# FOREX PAIRS
 # ==========================================
 
 PAIRS = [
-
     "EUR/USD",
     "GBP/USD",
     "USD/JPY",
@@ -56,8 +56,11 @@ PAIRS = [
     "NZD/USD",
     "USD/CHF",
     "AUD/JPY",
-    "CAD/JPY"
-
+    "CAD/JPY",
+    "EUR/AUD",
+    "GBP/AUD",
+    "EUR/CAD",
+    "GBP/CAD"
 ]
 
 # ==========================================
@@ -70,7 +73,7 @@ def get_market_data(symbol, interval):
         f"https://api.twelvedata.com/time_series"
         f"?symbol={symbol}"
         f"&interval={interval}"
-        f"&outputsize=100"
+        f"&outputsize=200"
         f"&apikey={API_KEY}"
     )
 
@@ -84,31 +87,99 @@ def get_market_data(symbol, interval):
     return data["values"]
 
 # ==========================================
+# SUPPORT & RESISTANCE
+# ==========================================
+
+def calculate_support_resistance(df):
+
+    support = df["low"].tail(20).min()
+
+    resistance = df["high"].tail(20).max()
+
+    return support, resistance
+
+# ==========================================
+# CANDLE PATTERN
+# ==========================================
+
+def detect_candle_pattern(df):
+
+    latest = df.iloc[-1]
+
+    body = abs(latest["close"] - latest["open"])
+
+    candle_range = latest["high"] - latest["low"]
+
+    if candle_range == 0:
+        return "NONE"
+
+    body_percent = body / candle_range
+
+    # Strong bullish candle
+    if (
+        latest["close"] > latest["open"]
+        and body_percent > 0.6
+    ):
+        return "BULLISH"
+
+    # Strong bearish candle
+    elif (
+        latest["close"] < latest["open"]
+        and body_percent > 0.6
+    ):
+        return "BEARISH"
+
+    return "NEUTRAL"
+
+# ==========================================
+# TREND STRENGTH
+# ==========================================
+
+def trend_strength(ema9, ema21):
+
+    diff = abs(ema9 - ema21)
+
+    if diff > 0.0015:
+        return "STRONG"
+
+    elif diff > 0.0007:
+        return "MEDIUM"
+
+    return "WEAK"
+
+# ==========================================
 # ANALYZE MARKET
 # ==========================================
 
 def analyze(symbol, interval):
 
-    df = pd.DataFrame(
-        get_market_data(symbol, interval)
-    )
+    raw_data = get_market_data(symbol, interval)
 
-    df["close"] = df["close"].astype(float)
+    df = pd.DataFrame(raw_data)
+
+    numeric_cols = [
+        "open",
+        "high",
+        "low",
+        "close"
+    ]
+
+    for col in numeric_cols:
+        df[col] = df[col].astype(float)
 
     # Reverse dataframe
     df = df.iloc[::-1]
 
-    # ==========================
+    # ==========================================
     # INDICATORS
-    # ==========================
+    # ==========================================
 
-    # EMA 9
+    # EMA
     df["ema9"] = ta.trend.ema_indicator(
         df["close"],
         window=9
     )
 
-    # EMA 21
     df["ema21"] = ta.trend.ema_indicator(
         df["close"],
         window=21
@@ -127,61 +198,112 @@ def analyze(symbol, interval):
 
     df["macd_signal"] = macd.macd_signal()
 
+    # ADX Trend Strength
+    adx = ta.trend.ADXIndicator(
+        high=df["high"],
+        low=df["low"],
+        close=df["close"]
+    )
+
+    df["adx"] = adx.adx()
+
     latest = df.iloc[-1]
 
-    # ==================================
+    # ==========================================
+    # SUPPORT & RESISTANCE
+    # ==========================================
+
+    support, resistance = calculate_support_resistance(df)
+
+    # ==========================================
+    # CANDLE PATTERN
+    # ==========================================
+
+    candle = detect_candle_pattern(df)
+
+    # ==========================================
     # SIGNAL LOGIC
-    # ==================================
+    # ==========================================
 
     signal = "WAIT"
 
     confidence = 50
 
+    reasons = []
+
+    # CALL CONDITIONS
+    bullish_conditions = [
+        latest["ema9"] > latest["ema21"],
+        latest["rsi"] > 50,
+        latest["macd"] > latest["macd_signal"],
+        candle == "BULLISH",
+        latest["close"] > support,
+        latest["adx"] > 20
+    ]
+
+    # PUT CONDITIONS
+    bearish_conditions = [
+        latest["ema9"] < latest["ema21"],
+        latest["rsi"] < 50,
+        latest["macd"] < latest["macd_signal"],
+        candle == "BEARISH",
+        latest["close"] < resistance,
+        latest["adx"] > 20
+    ]
+
+    bullish_score = bullish_conditions.count(True)
+
+    bearish_score = bearish_conditions.count(True)
+
     # CALL SIGNAL
-    if (
-
-        latest["ema9"] > latest["ema21"]
-        and latest["rsi"] > 50
-        and latest["macd"] > latest["macd_signal"]
-
-    ):
+    if bullish_score >= 5:
 
         signal = "CALL"
 
-        confidence = 85
+        confidence = min(95, bullish_score * 15)
+
+        reasons.append("Bullish EMA Trend")
+        reasons.append("RSI Momentum Up")
+        reasons.append("MACD Bullish")
+        reasons.append("Strong Candle")
 
     # PUT SIGNAL
-    elif (
-
-        latest["ema9"] < latest["ema21"]
-        and latest["rsi"] < 50
-        and latest["macd"] < latest["macd_signal"]
-
-    ):
+    elif bearish_score >= 5:
 
         signal = "PUT"
 
-        confidence = 85
+        confidence = min(95, bearish_score * 15)
+
+        reasons.append("Bearish EMA Trend")
+        reasons.append("RSI Momentum Down")
+        reasons.append("MACD Bearish")
+        reasons.append("Strong Candle")
+
+    # TREND QUALITY
+    trend = trend_strength(
+        latest["ema9"],
+        latest["ema21"]
+    )
 
     return {
-
         "pair": symbol,
-
         "timeframe": interval,
-
         "signal": signal,
-
         "confidence": confidence,
-
-        "rsi": round(latest["rsi"], 2)
-
+        "rsi": round(latest["rsi"], 2),
+        "adx": round(latest["adx"], 2),
+        "trend": trend,
+        "candle": candle,
+        "support": round(support, 5),
+        "resistance": round(resistance, 5),
+        "reasons": reasons
     }
 
 # ==========================================
-# START COMMAND
+# SHOW PAIRS
 # ==========================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_pairs(message):
 
     keyboard = []
 
@@ -190,36 +312,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, pair in enumerate(PAIRS, start=1):
 
         row.append(
-
             InlineKeyboardButton(
                 pair,
                 callback_data=f"pair_{pair}"
             )
-
         )
 
         if i % 2 == 0:
-
             keyboard.append(row)
-
             row = []
 
     if row:
-
         keyboard.append(row)
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
-
+    await message.reply_text(
         "📊 SELECT TRADING PAIR",
-
         reply_markup=reply_markup
-
     )
 
 # ==========================================
-# HANDLE BUTTONS
+# START COMMAND
+# ==========================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    await show_pairs(update.message)
+
+# ==========================================
+# BUTTON HANDLER
 # ==========================================
 
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -232,24 +354,20 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
-    # ==================================
+    # ==========================================
     # SELECT PAIR
-    # ==================================
+    # ==========================================
 
     if data.startswith("pair_"):
 
         pair = data.replace("pair_", "")
 
         user_data_store[chat_id] = {
-
             "pair": pair
-
         }
 
         keyboard = [
-
             [
-
                 InlineKeyboardButton(
                     "1m",
                     callback_data="tf_1min"
@@ -264,74 +382,34 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "5m",
                     callback_data="tf_5min"
                 )
-
             ],
 
             [
-
                 InlineKeyboardButton(
                     "⬅ BACK",
                     callback_data="back_pairs"
                 )
-
             ]
-
         ]
 
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await query.message.reply_text(
-
             f"✅ Pair Selected: {pair}\n\n⏰ Select Timeframe",
-
             reply_markup=reply_markup
-
         )
 
-    # ==================================
+    # ==========================================
     # BACK BUTTON
-    # ==================================
+    # ==========================================
 
     elif data == "back_pairs":
 
-        keyboard = []
+        await show_pairs(query.message)
 
-        row = []
-
-        for i, pair in enumerate(PAIRS, start=1):
-
-            row.append(
-
-                InlineKeyboardButton(
-                    pair,
-                    callback_data=f"pair_{pair}"
-                )
-
-            )
-
-            if i % 2 == 0:
-
-                keyboard.append(row)
-
-                row = []
-
-        if row:
-
-            keyboard.append(row)
-
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await query.message.reply_text(
-
-            "📊 SELECT TRADING PAIR",
-
-            reply_markup=reply_markup
-
-        )
-
-    # ==================================
-    # SELECT TIMEFRAME
-    # ==================================
+    # ==========================================
+    # TIMEFRAME
+    # ==========================================
 
     elif data.startswith("tf_"):
 
@@ -340,40 +418,31 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_data_store[chat_id]["timeframe"] = timeframe
 
         keyboard = [
-
             [
-
                 InlineKeyboardButton(
                     "📈 GET SIGNAL",
                     callback_data="get_signal"
                 )
-
             ],
 
             [
-
                 InlineKeyboardButton(
                     "⬅ BACK",
                     callback_data="back_pairs"
                 )
-
             ]
-
         ]
 
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await query.message.reply_text(
-
             f"✅ Timeframe Selected: {timeframe}",
-
             reply_markup=reply_markup
-
         )
 
-    # ==================================
+    # ==========================================
     # GET SIGNAL
-    # ==================================
+    # ==========================================
 
     elif data == "get_signal":
 
@@ -383,22 +452,18 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         result = analyze(pair, timeframe)
 
-        # Rwanda Time
         kigali = pytz.timezone("Africa/Kigali")
 
         now = datetime.now(kigali)
 
-        # Expire Time
+        # EXPIRE TIME
         if timeframe == "1min":
-
             expire = now + timedelta(minutes=1)
 
         elif timeframe == "3min":
-
             expire = now + timedelta(minutes=3)
 
         else:
-
             expire = now + timedelta(minutes=5)
 
         entry_time = now.strftime("%I:%M:%S %p")
@@ -409,17 +474,19 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         signal_emoji = "⏸"
 
         if result["signal"] == "CALL":
-
             signal_emoji = "⬆️"
 
         elif result["signal"] == "PUT":
-
             signal_emoji = "⬇️"
 
-        # MESSAGE
+        # REASONS
+        reasons = "\n".join(
+            [f"✅ {r}" for r in result["reasons"]]
+        )
+
         text = f"""
 ━━━━━━━━━━━━━━━
-📊 BINARY VIP SIGNAL
+📊 ADVANCED VIP SIGNAL
 ━━━━━━━━━━━━━━━
 
 💱 Pair: {result['pair']}
@@ -435,32 +502,41 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📊 RSI: {result['rsi']}
 
+🔥 ADX Trend: {result['adx']}
+
+📉 Trend Strength: {result['trend']}
+
+🕯 Candle: {result['candle']}
+
+🟢 Support: {result['support']}
+
+🔴 Resistance: {result['resistance']}
+
+━━━━━━━━━━━━━━━
+📌 ANALYSIS
+━━━━━━━━━━━━━━━
+
+{reasons}
+
 ━━━━━━━━━━━━━━━
 🔥 Trade Smart
 ━━━━━━━━━━━━━━━
 """
 
         keyboard = [
-
             [
-
                 InlineKeyboardButton(
                     "🔄 NEW SIGNAL",
                     callback_data="back_pairs"
                 )
-
             ]
-
         ]
 
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await query.message.reply_text(
-
             text,
-
             reply_markup=reply_markup
-
         )
 
 # ==========================================
@@ -470,18 +546,11 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 telegram_app = Application.builder().token(BOT_TOKEN).build()
 
 telegram_app.add_handler(
-
-    CommandHandler(
-        "start",
-        start
-    )
-
+    CommandHandler("start", start)
 )
 
 telegram_app.add_handler(
-
     CallbackQueryHandler(button_click)
-
 )
 
 # ==========================================
@@ -505,7 +574,6 @@ async def startup():
 def home():
 
     return {
-
-        "status": "RUNNING"
-
-    }
+        "status": "RUNNING",
+        "bot": "ACTIVE"
+        }
