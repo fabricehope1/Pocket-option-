@@ -5,3 +5,4 @@ pandas
 ta
 pytz
 python-telegram-bot==21.6
+numpy
