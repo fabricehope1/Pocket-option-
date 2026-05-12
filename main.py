@@ -2,7 +2,6 @@ import os
 import requests
 import pandas as pd
 import ta
-import imghdr
 
 from fastapi import FastAPI
 from telegram import Bot
